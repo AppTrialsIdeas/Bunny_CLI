@@ -1,28 +1,23 @@
 import { createComputeClient } from "@bunny.net/openapi-client";
-import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import { resolveConfig } from "../../../config/index.ts";
-import { clientOptions } from "../../../core/client-options.ts";
-import { defineCommand } from "../../../core/define-command.ts";
-import { formatTable } from "../../../core/format.ts";
-import { logger } from "../../../core/logger.ts";
-import { resolveManifestId } from "../../../core/manifest.ts";
-import { spinner } from "../../../core/ui.ts";
-import { SCRIPT_MANIFEST } from "../constants.ts";
-
-type EdgeScriptVariable = components["schemas"]["EdgeScriptVariableModel"];
-type EdgeScriptSecret = components["schemas"]["EdgeScriptSecretModel"];
+import { fetchEnvEntries } from "@/commands/scripts/api.ts";
+import {
+  type ScriptSelectorArgs,
+  scriptSelectorBuilder,
+  selectScript,
+} from "@/commands/scripts/interactive.ts";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { formatTable } from "@/core/format.ts";
+import { logger } from "@/core/logger.ts";
+import { spinner } from "@/core/ui.ts";
 
 const COMMAND = "list [id]";
 const ALIASES = ["ls"] as const;
 const DESCRIPTION =
   "List environment variables and secrets for an Edge Script.";
 
-const ARG_ID = "id";
-const ARG_ID_DESCRIPTION = "Edge Script ID (uses linked script if omitted)";
-
-interface ListArgs {
-  [ARG_ID]?: number;
-}
+type ListArgs = ScriptSelectorArgs;
 
 /**
  * List all environment variables and secrets for an Edge Script.
@@ -55,48 +50,24 @@ export const scriptsEnvListCommand = defineCommand<ListArgs>({
     ["$0 scripts env list --output json", "JSON output"],
   ],
 
-  builder: (yargs) =>
-    yargs.positional(ARG_ID, {
-      type: "number",
-      describe: ARG_ID_DESCRIPTION,
-    }),
+  builder: (yargs) => scriptSelectorBuilder(yargs),
 
-  handler: async ({ [ARG_ID]: rawId, profile, output, verbose, apiKey }) => {
-    const id = resolveManifestId(SCRIPT_MANIFEST, rawId, "script");
+  handler: async ({ id: rawId, link, profile, output, verbose, apiKey }) => {
     const config = resolveConfig(profile, apiKey, verbose);
     const client = createComputeClient(clientOptions(config, verbose));
+
+    const { id, offerLink } = await selectScript(client, {
+      id: rawId,
+      link,
+      output,
+    });
 
     const spin = spinner("Fetching environment variables...");
     spin.start();
 
-    const [scriptResult, secretsResult] = await Promise.all([
-      client.GET("/compute/script/{id}", {
-        params: { path: { id } },
-      }),
-      client.GET("/compute/script/{id}/secrets", {
-        params: { path: { id } },
-      }),
-    ]);
+    const entries = await fetchEnvEntries(client, id);
 
     spin.stop();
-
-    const variables = scriptResult.data?.EdgeScriptVariables ?? [];
-    const secrets = secretsResult.data?.Secrets ?? [];
-
-    const entries = [
-      ...variables.map((v: EdgeScriptVariable) => ({
-        id: v.Id ?? 0,
-        name: v.Name ?? "",
-        value: v.DefaultValue ?? "",
-        secret: false,
-      })),
-      ...secrets.map((s: EdgeScriptSecret) => ({
-        id: s.Id ?? 0,
-        name: s.Name ?? "",
-        value: "",
-        secret: true,
-      })),
-    ].sort((a, b) => a.name.localeCompare(b.name));
 
     if (output === "json") {
       logger.log(JSON.stringify(entries, null, 2));
@@ -105,6 +76,7 @@ export const scriptsEnvListCommand = defineCommand<ListArgs>({
 
     if (entries.length === 0) {
       logger.info("No environment variables or secrets found.");
+      await offerLink();
       return;
     }
 
@@ -120,5 +92,7 @@ export const scriptsEnvListCommand = defineCommand<ListArgs>({
         output,
       ),
     );
+
+    await offerLink();
   },
 });

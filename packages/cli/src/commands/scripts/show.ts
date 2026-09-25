@@ -1,25 +1,26 @@
-import { createComputeClient } from "@bunny.net/openapi-client";
-import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import { resolveConfig } from "../../config/index.ts";
-import { clientOptions } from "../../core/client-options.ts";
-import { defineCommand } from "../../core/define-command.ts";
-import { formatKeyValue, formatTable } from "../../core/format.ts";
-import { logger } from "../../core/logger.ts";
-import { resolveManifestId } from "../../core/manifest.ts";
-import { spinner } from "../../core/ui.ts";
-import { SCRIPT_MANIFEST, SCRIPT_TYPE_LABELS } from "./constants.ts";
-
-type EdgeScript = components["schemas"]["EdgeScriptModel"];
+import {
+  createComputeClient,
+  createCoreClient,
+} from "@bunny.net/openapi-client";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { formatKeyValue, formatTable } from "@/core/format.ts";
+import { hostnameUrl, toSafeHostname } from "@/core/hostnames/index.ts";
+import { logger } from "@/core/logger.ts";
+import { spinner } from "@/core/ui.ts";
+import { fetchScriptHostnames } from "./api.ts";
+import { scriptTypeLabel } from "./constants.ts";
+import {
+  type ScriptSelectorArgs,
+  scriptSelectorBuilder,
+  selectScript,
+} from "./interactive.ts";
 
 const COMMAND = "show [id]";
 const DESCRIPTION = "Show details of an Edge Script.";
 
-const ARG_ID = "id";
-const ARG_ID_DESCRIPTION = "Edge Script ID (uses linked script if omitted)";
-
-interface ShowArgs {
-  [ARG_ID]?: EdgeScript["Id"];
-}
+type ShowArgs = ScriptSelectorArgs;
 
 /**
  * Show details of an Edge Script.
@@ -49,33 +50,36 @@ export const scriptsShowCommand = defineCommand<ShowArgs>({
     ["$0 scripts show --output json", "JSON output"],
   ],
 
-  builder: (yargs) =>
-    yargs.positional(ARG_ID, {
-      type: "number",
-      describe: ARG_ID_DESCRIPTION,
-    }),
+  builder: (yargs) => scriptSelectorBuilder(yargs),
 
-  handler: async ({ [ARG_ID]: rawId, profile, output, verbose, apiKey }) => {
-    const id = resolveManifestId(SCRIPT_MANIFEST, rawId, "script");
+  handler: async ({ id: rawId, link, profile, output, verbose, apiKey }) => {
     const config = resolveConfig(profile, apiKey, verbose);
-    const client = createComputeClient(clientOptions(config, verbose));
+    const options = clientOptions(config, verbose);
+    const client = createComputeClient(options);
 
-    const spin = spinner("Fetching Edge Script...");
+    const { script, offerLink } = await selectScript(client, {
+      id: rawId,
+      link,
+      output,
+    });
+
+    const spin = spinner("Fetching hostnames...");
     spin.start();
 
-    const { data: script } = await client.GET("/compute/script/{id}", {
-      params: { path: { id } },
-    });
+    // Pull each linked pull zone's hostnames (incl. custom domains + SSL state).
+    const coreClient = createCoreClient(options);
+    const hostnames = await fetchScriptHostnames(coreClient, script, verbose);
 
     spin.stop();
 
-    if (!script) {
-      logger.error("Edge Script not found.");
-      process.exit(1);
-    }
-
     if (output === "json") {
-      logger.log(JSON.stringify(script, null, 2));
+      logger.log(
+        JSON.stringify(
+          { ...script, Hostnames: hostnames.map(toSafeHostname) },
+          null,
+          2,
+        ),
+      );
       return;
     }
 
@@ -86,7 +90,7 @@ export const scriptsShowCommand = defineCommand<ShowArgs>({
           { key: "Name", value: script.Name ?? "" },
           {
             key: "Type",
-            value: SCRIPT_TYPE_LABELS[script.ScriptType ?? -1] ?? "Unknown",
+            value: scriptTypeLabel(script.ScriptType),
           },
           { key: "Default Hostname", value: script.DefaultHostname ?? "" },
           { key: "System Hostname", value: script.SystemHostname ?? "" },
@@ -126,6 +130,26 @@ export const scriptsShowCommand = defineCommand<ShowArgs>({
       );
     }
 
+    if (hostnames.length > 0) {
+      logger.log();
+      logger.log("Hostnames:");
+      logger.log(
+        formatTable(
+          ["Hostname", "Type", "SSL", "Force SSL"],
+          hostnames.map((h) => [
+            hostnameUrl(h.Value ?? "", {
+              hasCertificate: h.HasCertificate,
+              forceSSL: h.ForceSSL,
+            }),
+            h.IsSystemHostname ? "System" : "Custom",
+            h.HasCertificate ? "Yes" : "No",
+            h.ForceSSL ? "Yes" : "No",
+          ]),
+          output,
+        ),
+      );
+    }
+
     const variables = script.EdgeScriptVariables ?? [];
     if (variables.length > 0) {
       logger.log();
@@ -143,5 +167,7 @@ export const scriptsShowCommand = defineCommand<ShowArgs>({
         ),
       );
     }
+
+    await offerLink();
   },
 });

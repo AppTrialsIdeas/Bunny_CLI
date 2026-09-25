@@ -1,17 +1,16 @@
 import { createComputeClient } from "@bunny.net/openapi-client";
-import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import prompts from "prompts";
-import { resolveConfig } from "../../../config/index.ts";
-import { clientOptions } from "../../../core/client-options.ts";
-import { defineCommand } from "../../../core/define-command.ts";
-import { UserError } from "../../../core/errors.ts";
-import { logger } from "../../../core/logger.ts";
-import { resolveManifestId } from "../../../core/manifest.ts";
-import { confirm, spinner } from "../../../core/ui.ts";
-import { SCRIPT_MANIFEST } from "../constants.ts";
-
-type EdgeScriptVariable = components["schemas"]["EdgeScriptVariableModel"];
-type EdgeScriptSecret = components["schemas"]["EdgeScriptSecretModel"];
+import { fetchEnvEntries } from "@/commands/scripts/api.ts";
+import {
+  type ScriptSelectorArgs,
+  scriptIdOptionBuilder,
+  selectScript,
+} from "@/commands/scripts/interactive.ts";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { UserError } from "@/core/errors.ts";
+import { logger } from "@/core/logger.ts";
+import { confirm, prompts, spinner } from "@/core/ui.ts";
 
 const COMMAND = "remove [name]";
 const ALIASES = ["rm"] as const;
@@ -20,22 +19,13 @@ const DESCRIPTION =
 
 const ARG_NAME = "name";
 const ARG_NAME_DESCRIPTION = "Variable or secret name to remove";
-const ARG_ID = "id";
-const ARG_ID_DESCRIPTION = "Edge Script ID (uses linked script if omitted)";
 const ARG_FORCE = "force";
 const ARG_FORCE_ALIAS = "f";
 const ARG_FORCE_DESCRIPTION = "Skip confirmation prompt";
 
-interface RemoveArgs {
+interface RemoveArgs extends ScriptSelectorArgs {
   [ARG_NAME]?: string;
-  [ARG_ID]?: number;
   [ARG_FORCE]?: boolean;
-}
-
-interface EnvEntry {
-  id: number;
-  name: string;
-  secret: boolean;
 }
 
 /**
@@ -73,67 +63,47 @@ export const scriptsEnvRemoveCommand = defineCommand<RemoveArgs>({
   ],
 
   builder: (yargs) =>
-    yargs
-      .positional(ARG_NAME, {
+    scriptIdOptionBuilder(
+      yargs.positional(ARG_NAME, {
         type: "string",
         describe: ARG_NAME_DESCRIPTION,
-      })
-      .option(ARG_ID, {
-        type: "number",
-        describe: ARG_ID_DESCRIPTION,
-      })
-      .option(ARG_FORCE, {
-        alias: ARG_FORCE_ALIAS,
-        type: "boolean",
-        default: false,
-        describe: ARG_FORCE_DESCRIPTION,
       }),
+    ).option(ARG_FORCE, {
+      alias: ARG_FORCE_ALIAS,
+      type: "boolean",
+      default: false,
+      describe: ARG_FORCE_DESCRIPTION,
+    }),
 
   handler: async ({
     [ARG_NAME]: rawName,
-    [ARG_ID]: rawId,
+    id: rawId,
     [ARG_FORCE]: force,
+    link,
     profile,
     output,
     verbose,
     apiKey,
   }) => {
-    const id = resolveManifestId(SCRIPT_MANIFEST, rawId, "script");
     const config = resolveConfig(profile, apiKey, verbose);
     const client = createComputeClient(clientOptions(config, verbose));
+
+    const { id, offerLink } = await selectScript(client, {
+      id: rawId,
+      link,
+      output,
+    });
 
     const spin = spinner("Fetching environment variables...");
     spin.start();
 
-    const [scriptResult, secretsResult] = await Promise.all([
-      client.GET("/compute/script/{id}", {
-        params: { path: { id } },
-      }),
-      client.GET("/compute/script/{id}/secrets", {
-        params: { path: { id } },
-      }),
-    ]);
+    const entries = await fetchEnvEntries(client, id);
 
     spin.stop();
 
-    const variables = scriptResult.data?.EdgeScriptVariables ?? [];
-    const secrets = secretsResult.data?.Secrets ?? [];
-
-    const entries: EnvEntry[] = [
-      ...variables.map((v: EdgeScriptVariable) => ({
-        id: v.Id ?? 0,
-        name: v.Name ?? "",
-        secret: false,
-      })),
-      ...secrets.map((s: EdgeScriptSecret) => ({
-        id: s.Id ?? 0,
-        name: s.Name ?? "",
-        secret: true,
-      })),
-    ].sort((a, b) => a.name.localeCompare(b.name));
-
     if (entries.length === 0) {
       logger.info("No environment variables or secrets found.");
+      await offerLink();
       return;
     }
 
@@ -151,8 +121,7 @@ export const scriptsEnvRemoveCommand = defineCommand<RemoveArgs>({
       name = value;
     }
     if (!name) {
-      logger.log("Cancelled.");
-      return;
+      throw new UserError("Cancelled.");
     }
 
     const entry = entries.find(
@@ -196,5 +165,7 @@ export const scriptsEnvRemoveCommand = defineCommand<RemoveArgs>({
     logger.success(
       `Removed ${entry.secret ? "secret" : "variable"} "${entry.name}".`,
     );
+
+    await offerLink();
   },
 });

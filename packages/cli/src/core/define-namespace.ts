@@ -1,8 +1,12 @@
 import type { Argv, CommandModule } from "yargs";
-
+import { bunny } from "./colors.ts";
+import { groupHelpOptions } from "./define-command.ts";
 /**
  * Groups subcommands under a parent namespace. Running the namespace
  * without a subcommand shows help.
+ *
+ * Pass `describe: false` to hide the namespace from help (e.g. a hidden
+ * alias). Pass `aliases` to expose alternative names shown in help.
  *
  * @example
  * ```ts
@@ -15,20 +19,31 @@ import type { Argv, CommandModule } from "yargs";
  */
 export function defineNamespace(
   command: string,
-  describe: string,
+  describe: string | false,
   subcommands: CommandModule[],
+  aliases?: string[],
 ): CommandModule {
   let yRef: Argv;
   return {
     command,
+    aliases,
     describe,
     builder: (yargs) => {
       yRef = yargs;
       for (const sub of subcommands) yargs.command(sub);
+      groupHelpOptions(yargs);
       return yargs;
     },
-    handler: () => {
-      yRef.showHelp("log");
+    handler: async () => {
+      try {
+        const helpText = await yRef.getHelp();
+        const colored = helpText
+          .replace(/^Commands:/m, bunny.bold("Commands:"))
+          .replace(/^Options:/m, bunny.bold("Options:"));
+        console.log(colored);
+      } catch (err) {
+        console.error("Failed to load help text:", err);
+      }
     },
   };
 }

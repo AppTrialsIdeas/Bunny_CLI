@@ -1,5 +1,33 @@
 # @bunny.net/openapi-client
 
+## 0.3.0
+
+### Minor Changes
+
+- [#157](https://github.com/BunnyWay/cli/pull/157) [`cdb130a`](https://github.com/BunnyWay/cli/commit/cdb130ad869c96eee4bee8eef610e360f51b4958) Thanks [@jamie-at-bunny](https://github.com/jamie-at-bunny)! - Standalone-library DX improvements: export `authMiddleware` so custom `openapi-fetch` clients can reuse the shared auth/error-normalization middleware; add per-API subpath entrypoints (`@bunny.net/openapi-client/core`, `/compute`, `/database`, `/magic-containers`, `/origin-errors`, `/shield`, `/storage`, `/stream`) that bundle each client factory with its generated spec types (the `generated/*` paths remain for backwards compatibility); and fill in npm metadata — license (MIT, with a bundled LICENSE file), description, repository, homepage, bugs, keywords, `sideEffects: false`, and an `engines` field (Node ≥ 18).
+
+### Patch Changes
+
+- [#156](https://github.com/BunnyWay/cli/pull/156) [`3dff411`](https://github.com/BunnyWay/cli/commit/3dff411468a9bf3602dfd66f0bdc0a9f2cbf851e) Thanks [@jamie-at-bunny](https://github.com/jamie-at-bunny)! - refresh OpenAPI specs from the sources listed at https://bunny.net/docs/openapi
+
+## 0.2.0
+
+### Minor Changes
+
+- [#100](https://github.com/BunnyWay/cli/pull/100) [`8b8adb4`](https://github.com/BunnyWay/cli/commit/8b8adb486046513c5921daa06ee6befe9c221334) Thanks [@jamie-at-bunny](https://github.com/jamie-at-bunny)! - add bunny.net container registry support
+
+## 0.1.2
+
+### Patch Changes
+
+- [#107](https://github.com/BunnyWay/cli/pull/107) [`18645ed`](https://github.com/BunnyWay/cli/commit/18645edc7736eb5d88f1a8ec038993cc7d2deb12) Thanks [@jamie-at-bunny](https://github.com/jamie-at-bunny)! - feat(dns): import a domain's existing records when moving to bunny: new `dns records scan [domain]` (server-side record scan, multiselect, bulk-write) and `dns zones add --import` offer the same migration right after creating the zone; a bad record is reported rather than stranding the batch, and CAA flags/tag survive via corrected `DnsDiscoveredRecord` types in `@bunny.net/openapi-client`
+
+## 0.1.1
+
+### Patch Changes
+
+- [#91](https://github.com/BunnyWay/cli/pull/91) [`73cb7a7`](https://github.com/BunnyWay/cli/commit/73cb7a74741898144dbc80e4b8554f102d7c8f03) Thanks [@jamie-at-bunny](https://github.com/jamie-at-bunny)! - fix: let legitimate non-JSON 200 responses pass the proxy-interception guard
+
 ## 0.1.0
 
 ### Minor Changes

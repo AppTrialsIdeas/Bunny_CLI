@@ -1,18 +1,31 @@
 import { basename, resolve } from "node:path";
-import { createComputeClient } from "@bunny.net/openapi-client";
-import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import prompts from "prompts";
-import { resolveConfig } from "../../config/index.ts";
-import { clientOptions } from "../../core/client-options.ts";
-import { defineCommand } from "../../core/define-command.ts";
-import { UserError } from "../../core/errors.ts";
-import { formatKeyValue } from "../../core/format.ts";
-import { logger } from "../../core/logger.ts";
-import { loadManifest, saveManifest } from "../../core/manifest.ts";
-import { confirm, openBrowser, spinner } from "../../core/ui.ts";
-import { SCRIPT_MANIFEST } from "./constants.ts";
-
-type EdgeScriptTypes = components["schemas"]["EdgeScriptTypes"];
+import {
+  createComputeClient,
+  createCoreClient,
+} from "@bunny.net/openapi-client";
+import { autoLinkDnsZone } from "@/commands/dns/interactive.ts";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { UserError } from "@/core/errors.ts";
+import { formatKeyValue } from "@/core/format.ts";
+import {
+  addHostname,
+  normalizeHostname,
+  setupHostname,
+} from "@/core/hostnames/index.ts";
+import { logger } from "@/core/logger.ts";
+import { loadManifest, saveManifest } from "@/core/manifest.ts";
+import { confirm, prompts, spinner } from "@/core/ui.ts";
+import { promptOpenInBrowser } from "./api.ts";
+import {
+  type EdgeScriptTypes,
+  parseScriptType,
+  SCRIPT_MANIFEST,
+  SCRIPT_TYPE_MIDDLEWARE,
+  SCRIPT_TYPE_STANDALONE,
+  scriptTypeLabel,
+} from "./constants.ts";
 
 const COMMAND = "create [name]";
 const DESCRIPTION = "Create a new Edge Script on bunny.net.";
@@ -29,6 +42,9 @@ const ARG_PULL_ZONE_NAME_DESCRIPTION = "Name for the linked pull zone";
 const ARG_LINK = "link";
 const ARG_LINK_DESCRIPTION =
   "Link this directory to the new script (default: true). Use --no-link to skip.";
+const ARG_DOMAIN = "domain";
+const ARG_DOMAIN_DESCRIPTION =
+  "Add a custom domain to the new script's pull zone (prompted when interactive)";
 
 interface CreateArgs {
   [ARG_NAME]?: string;
@@ -36,6 +52,7 @@ interface CreateArgs {
   [ARG_PULL_ZONE]?: boolean;
   [ARG_PULL_ZONE_NAME]?: string;
   [ARG_LINK]?: boolean;
+  [ARG_DOMAIN]?: string;
 }
 
 interface CreatedScript {
@@ -43,6 +60,7 @@ interface CreatedScript {
   name: string;
   scriptType: EdgeScriptTypes;
   hostname?: string;
+  pullZoneId?: number;
 }
 
 /**
@@ -89,7 +107,45 @@ export async function createScript(opts: {
     name: script.Name ?? opts.name,
     scriptType: opts.scriptType,
     hostname: script.LinkedPullZones?.[0]?.DefaultHostname ?? undefined,
+    pullZoneId: script.LinkedPullZones?.[0]?.Id ?? undefined,
   };
+}
+
+/**
+ * Attach a custom domain to the new script's pull zone, print the DNS
+ * instructions, and (when interactive) offer to wait for DNS and enable
+ * HTTPS. A failure to add the domain is a warning, not an error — the
+ * script itself was already created.
+ *
+ * Shared between `scripts create` and `scripts init`. Returns true when
+ * an SSL certificate was issued for the domain.
+ */
+export async function setupCustomDomain(opts: {
+  profile: string;
+  apiKey?: string;
+  verbose: boolean;
+  pullZoneId: number;
+  domain: string;
+  scriptId: number;
+  linked: boolean;
+  interactive: boolean;
+}): Promise<boolean> {
+  const config = resolveConfig(opts.profile, opts.apiKey, opts.verbose);
+  const coreClient = createCoreClient(clientOptions(config, opts.verbose));
+  const idSuffix = opts.linked ? "" : ` --id ${opts.scriptId}`;
+
+  return setupHostname({
+    coreClient,
+    pullZoneId: opts.pullZoneId,
+    domain: opts.domain,
+    sslHint: `bunny scripts domains ssl ${opts.domain}${idSuffix}`,
+    retryHint: `bunny scripts domains add ${opts.domain}${idSuffix}`,
+    forceSsl: true,
+    interactive: opts.interactive,
+    verbose: opts.verbose,
+    // Only link the directory when this is a linked script project.
+    onBunnyDnsZone: opts.linked ? autoLinkDnsZone : undefined,
+  });
 }
 
 /**
@@ -128,6 +184,10 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
       "$0 scripts create my-script --no-pull-zone --no-link",
       "Skip pull zone creation and directory linking",
     ],
+    [
+      "$0 scripts create my-script --domain shop.example.com",
+      "Create and attach a custom domain",
+    ],
   ],
 
   builder: (yargs) =>
@@ -152,6 +212,10 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
       .option(ARG_LINK, {
         type: "boolean",
         describe: ARG_LINK_DESCRIPTION,
+      })
+      .option(ARG_DOMAIN, {
+        type: "string",
+        describe: ARG_DOMAIN_DESCRIPTION,
       }),
 
   handler: async (args) => {
@@ -161,31 +225,49 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
     const name = args[ARG_NAME] ?? basename(resolve(process.cwd()));
     if (!name) throw new UserError("Script name is required.");
 
+    const domainFlag = args[ARG_DOMAIN]
+      ? normalizeHostname(args[ARG_DOMAIN])
+      : undefined;
+    if (domainFlag && args[ARG_PULL_ZONE] === false) {
+      throw new UserError(
+        "--domain requires a linked pull zone.",
+        "Drop --no-pull-zone to attach a custom domain.",
+      );
+    }
+
+    const manifest = loadManifest(SCRIPT_MANIFEST);
+
     // Resolve script type: explicit flag → manifest → prompt → error.
-    let scriptType: EdgeScriptTypes | undefined;
-    if (args[ARG_TYPE]) {
-      scriptType = args[ARG_TYPE] === "standalone" ? 1 : 2;
-    } else {
-      const manifest = loadManifest(SCRIPT_MANIFEST);
-      if (manifest.scriptType === 1 || manifest.scriptType === 2) {
-        scriptType = manifest.scriptType as EdgeScriptTypes;
+    let scriptType = parseScriptType(args[ARG_TYPE]);
+    if (scriptType === undefined) {
+      if (
+        manifest.scriptType === SCRIPT_TYPE_STANDALONE ||
+        manifest.scriptType === SCRIPT_TYPE_MIDDLEWARE
+      ) {
+        scriptType = manifest.scriptType;
       } else if (isInteractive) {
         const { value } = await prompts({
           type: "select",
           name: "value",
           message: "Script type:",
           choices: [
-            { title: "Standalone — handles requests independently", value: 1 },
+            {
+              title: "Standalone — handles requests independently",
+              value: SCRIPT_TYPE_STANDALONE,
+            },
             {
               title: "Middleware — processes requests before/after origin",
-              value: 2,
+              value: SCRIPT_TYPE_MIDDLEWARE,
             },
           ],
         });
         scriptType = value;
       }
     }
-    if (scriptType !== 1 && scriptType !== 2) {
+    if (
+      scriptType !== SCRIPT_TYPE_STANDALONE &&
+      scriptType !== SCRIPT_TYPE_MIDDLEWARE
+    ) {
       throw new UserError(
         "Script type is required.",
         "Pass --type standalone or --type middleware.",
@@ -203,14 +285,14 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
     });
 
     // Decide whether to link this directory to the new script.
-    const existing = loadManifest(SCRIPT_MANIFEST);
     const linkArg = args[ARG_LINK];
     let shouldLink: boolean;
     if (linkArg !== undefined) {
       shouldLink = linkArg;
-    } else if (isInteractive && existing.id && existing.id !== created.id) {
+    } else if (isInteractive && manifest.id && manifest.id !== created.id) {
       shouldLink = await confirm(
-        `Replace existing link to ${existing.name ?? existing.id}?`,
+        `Replace existing link to ${manifest.name ?? manifest.id}?`,
+        { optional: true },
       );
     } else {
       shouldLink = true;
@@ -225,6 +307,30 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
     }
 
     if (output === "json") {
+      // --domain is added non-interactively; a failure still reports the created script.
+      let customDomain: {
+        hostname: string;
+        cnameTarget: string | null;
+      } | null = null;
+      let customDomainError: string | undefined;
+      if (domainFlag && created.pullZoneId != null) {
+        const config = resolveConfig(profile, apiKey, verbose);
+        const coreClient = createCoreClient(clientOptions(config, verbose));
+        try {
+          const { cnameTarget } = await addHostname(
+            coreClient,
+            created.pullZoneId,
+            domainFlag,
+          );
+          customDomain = {
+            hostname: domainFlag,
+            cnameTarget: cnameTarget ?? null,
+          };
+        } catch (err) {
+          customDomainError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
       logger.log(
         JSON.stringify(
           {
@@ -233,11 +339,14 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
             scriptType: created.scriptType,
             hostname: created.hostname ?? null,
             linked: shouldLink,
+            customDomain,
+            ...(customDomainError ? { customDomainError } : {}),
           },
           null,
           2,
         ),
       );
+      if (customDomainError) process.exit(1);
       return;
     }
 
@@ -246,7 +355,7 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
       { key: "Name", value: created.name },
       {
         key: "Type",
-        value: created.scriptType === 1 ? "Standalone" : "Middleware",
+        value: scriptTypeLabel(created.scriptType),
       },
     ];
     if (created.hostname) {
@@ -264,19 +373,53 @@ export const scriptsCreateCommand = defineCommand<CreateArgs>({
 
     logger.log();
 
-    if (created.hostname && isInteractive) {
-      const shouldOpen = await confirm("Open script in browser?");
-      if (shouldOpen) {
-        const url = created.hostname.startsWith("http")
-          ? created.hostname
-          : `https://${created.hostname}`;
-        logger.dim(`  Opening ${url}`);
-        openBrowser(url);
-      } else {
-        logger.dim(
-          "  Make changes locally, then run `bunny scripts deploy <file>` to publish.",
-        );
+    // Custom domain: --domain flag, or offer one interactively when a pull zone exists.
+    let openTarget = created.hostname;
+    if (created.pullZoneId != null) {
+      let domain = domainFlag;
+      if (!domain && isInteractive) {
+        const { value } = await prompts({
+          type: "text",
+          name: "value",
+          message: "Custom domain (leave blank to skip):",
+        });
+        domain = normalizeHostname(value ?? "");
       }
+
+      if (domain) {
+        // A domain failure mustn't fail the command — the script already exists.
+        try {
+          const sslIssued = await setupCustomDomain({
+            profile,
+            apiKey,
+            verbose,
+            pullZoneId: created.pullZoneId,
+            domain,
+            scriptId: created.id,
+            linked: shouldLink,
+            interactive: isInteractive,
+          });
+          if (sslIssued) openTarget = domain;
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : "";
+          const idSuffix = shouldLink ? "" : ` --id ${created.id}`;
+          logger.warn(
+            message
+              ? `Couldn't finish setting up ${domain}: ${message}`
+              : `Couldn't finish setting up ${domain}.`,
+          );
+          logger.dim(
+            `  Retry later: bunny scripts domains add ${domain}${idSuffix} --wait`,
+          );
+        }
+        logger.log();
+      }
+    } else if (domainFlag) {
+      logger.warn("No linked pull zone — can't attach a custom domain.");
+    }
+
+    if (openTarget && isInteractive) {
+      await promptOpenInBrowser(openTarget);
     } else {
       logger.dim(`  Deploy:  bunny scripts deploy <file>`);
     }

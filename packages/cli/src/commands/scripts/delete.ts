@@ -1,13 +1,12 @@
 import { createComputeClient } from "@bunny.net/openapi-client";
 import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import prompts from "prompts";
-import { resolveConfig } from "../../config/index.ts";
-import { clientOptions } from "../../core/client-options.ts";
-import { defineCommand } from "../../core/define-command.ts";
-import { UserError } from "../../core/errors.ts";
-import { logger } from "../../core/logger.ts";
-import { resolveManifestId } from "../../core/manifest.ts";
-import { confirm, spinner } from "../../core/ui.ts";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { logger } from "@/core/logger.ts";
+import { resolveManifestId } from "@/core/manifest.ts";
+import { confirm, confirmTyped, spinner } from "@/core/ui.ts";
+import { fetchScript } from "./api.ts";
 import { SCRIPT_MANIFEST } from "./constants.ts";
 
 type EdgeScript = components["schemas"]["EdgeScriptModel"];
@@ -50,6 +49,7 @@ interface DeleteArgs {
  */
 export const scriptsDeleteCommand = defineCommand<DeleteArgs>({
   command: COMMAND,
+  aliases: ["rm"],
   describe: DESCRIPTION,
   examples: [
     ["$0 scripts delete 12345", "Interactive — double confirmation"],
@@ -85,35 +85,19 @@ export const scriptsDeleteCommand = defineCommand<DeleteArgs>({
     const fetchSpin = spinner("Fetching Edge Script...");
     fetchSpin.start();
 
-    const { data: script } = await client.GET("/compute/script/{id}", {
-      params: { path: { id } },
-    });
+    const script = await fetchScript(client, id);
 
     fetchSpin.stop();
 
-    if (!script) throw new UserError(`Edge Script ${id} not found.`);
-
-    const confirmed = await confirm(
-      `Delete Edge Script "${script.Name}" (${id})? This cannot be undone.`,
-      { force },
-    );
+    const confirmed =
+      (await confirm(
+        `Delete Edge Script "${script.Name}" (${id})? This cannot be undone.`,
+        { force },
+      )) && (await confirmTyped(script.Name ?? "", { force }));
 
     if (!confirmed) {
       logger.log("Cancelled.");
       return;
-    }
-
-    if (!force) {
-      const { value } = await prompts({
-        type: "text",
-        name: "value",
-        message: `Type "${script.Name}" to confirm:`,
-      });
-
-      if (value !== script.Name) {
-        logger.log("Cancelled.");
-        return;
-      }
     }
 
     const deleteSpin = spinner("Deleting Edge Script...");

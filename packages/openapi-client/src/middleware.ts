@@ -70,6 +70,22 @@ const extractors: Array<
  * Command handlers never need to check `response.ok` or parse error bodies —
  * a failed request throws before it reaches handler code.
  */
+
+const SECRET_KEY = /password|secret|token|accesskey|apikey|credential/i;
+
+function redact(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redact);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [
+      key,
+      SECRET_KEY.test(key) && typeof child !== "object"
+        ? "[redacted]"
+        : redact(child),
+    ]),
+  );
+}
+
 export function authMiddleware(options: ClientOptions): Middleware {
   const {
     apiKey,
@@ -90,14 +106,14 @@ export function authMiddleware(options: ClientOptions): Middleware {
           const cloned = request.clone();
           try {
             const body = await cloned.json();
-            debug(`→ Body: ${JSON.stringify(body, null, 2)}`);
+            debug(`→ Body: ${JSON.stringify(redact(body), null, 2)}`);
           } catch {}
         }
       }
 
       return request;
     },
-    async onResponse({ response }) {
+    async onResponse({ response, options }) {
       if (debug) {
         const cloned = response.clone();
         debug(`← ${response.status} ${response.statusText}`);
@@ -105,7 +121,7 @@ export function authMiddleware(options: ClientOptions): Middleware {
         if (looksLikeJson(contentType)) {
           try {
             const body = await cloned.json();
-            debug(`← Body: ${JSON.stringify(body, null, 2)}`);
+            debug(`← Body: ${JSON.stringify(redact(body), null, 2)}`);
           } catch {}
         } else {
           // Non-JSON body - surface the raw text (truncated) so the
@@ -118,14 +134,16 @@ export function authMiddleware(options: ClientOptions): Middleware {
         }
       }
 
-      // OK responses with a non-JSON body would otherwise crash
-      // openapi-fetch when it tries to JSON.parse the bytes. Detect
-      // that here and translate it into a clearer ApiError. This
-      // commonly happens when a CDN / proxy / captive portal serves an
-      // HTML error page with a 200 status code.
+      // openapi-fetch only JSON.parses the body when parseAs is "json" (its
+      // default). Callers that fetch downloads opt out via parseAs: "text"
+      // (etc.), so a non-JSON body is expected there and passes through. A
+      // non-JSON body on a JSON call is almost always a CDN / proxy / captive
+      // portal serving an HTML error page with a 200 status — surface that as
+      // a clear ApiError instead of letting openapi-fetch crash on JSON.parse.
       if (response.ok) {
+        const parseAs = options?.parseAs ?? "json";
         const contentType = response.headers.get("content-type") ?? "";
-        if (!looksLikeJson(contentType)) {
+        if (parseAs === "json" && !looksLikeJson(contentType)) {
           const text = await response.clone().text();
           if (text.trim().length > 0) {
             const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;

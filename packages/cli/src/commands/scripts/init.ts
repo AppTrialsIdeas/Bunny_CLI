@@ -1,17 +1,26 @@
 import { existsSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import prompts from "prompts";
-import { defineCommand } from "../../core/define-command.ts";
-import { UserError } from "../../core/errors.ts";
-import { logger } from "../../core/logger.ts";
-import { saveManifestAt } from "../../core/manifest.ts";
-import { confirm, openBrowser, spinner } from "../../core/ui.ts";
-import { SCRIPT_MANIFEST, TEMPLATES, type Template } from "./constants.ts";
-import { createScript } from "./create.ts";
-import { detectFromLockfile, pickPackageManager } from "./package-manager.ts";
-
-type EdgeScriptTypes = components["schemas"]["EdgeScriptTypes"];
+import { defineCommand } from "@/core/define-command.ts";
+import { UserError } from "@/core/errors.ts";
+import { normalizeHostname } from "@/core/hostnames/index.ts";
+import { logger } from "@/core/logger.ts";
+import { saveManifestAt } from "@/core/manifest.ts";
+import {
+  detectFromLockfile,
+  pickPackageManager,
+} from "@/core/package-manager.ts";
+import { confirm, prompts, spinner } from "@/core/ui.ts";
+import { promptOpenInBrowser } from "./api.ts";
+import {
+  type EdgeScriptTypes,
+  parseScriptType,
+  SCRIPT_MANIFEST,
+  SCRIPT_TYPE_MIDDLEWARE,
+  SCRIPT_TYPE_STANDALONE,
+  TEMPLATES,
+  type Template,
+} from "./constants.ts";
+import { createScript, setupCustomDomain } from "./create.ts";
 
 const COMMAND = "init";
 const DESCRIPTION = "Create a new Edge Script project.";
@@ -154,22 +163,25 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
     }
 
     // Step 2: Script type
-    let scriptType: EdgeScriptTypes | undefined;
-    if (args[ARG_TYPE]) {
-      scriptType = args[ARG_TYPE] === "standalone" ? 1 : 2;
-    } else if (args[ARG_TEMPLATE_REPO]) {
+    let scriptType: EdgeScriptTypes | undefined = parseScriptType(
+      args[ARG_TYPE],
+    );
+    if (scriptType === undefined && args[ARG_TEMPLATE_REPO]) {
       // Custom template repo implies the user knows what they're doing — default to standalone
-      scriptType = 1;
-    } else {
+      scriptType = SCRIPT_TYPE_STANDALONE;
+    } else if (scriptType === undefined) {
       const { value } = await prompts({
         type: "select",
         name: "value",
         message: "Script type:",
         choices: [
-          { title: "Standalone — handles requests independently", value: 1 },
+          {
+            title: "Standalone — handles requests independently",
+            value: SCRIPT_TYPE_STANDALONE,
+          },
           {
             title: "Middleware — processes requests before/after origin",
-            value: 2,
+            value: SCRIPT_TYPE_MIDDLEWARE,
           },
         ],
       });
@@ -227,6 +239,7 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
     } else if (interactive) {
       enableGithubActions = await confirm(
         "Enable continuous integration with GitHub Actions?",
+        { optional: true },
       );
     } else {
       enableGithubActions = false;
@@ -292,13 +305,13 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
       // would otherwise run silently in non-interactive mode.
       const shouldInstall =
         interactive || args[ARG_TEMPLATE_REPO]
-          ? await confirm("Install dependencies?")
+          ? await confirm("Install dependencies?", { optional: true })
           : true;
       if (shouldInstall) {
         const pm = await pickPackageManager(dirPath);
         if (!pm) {
           logger.warn(
-            "No package manager found on PATH. Install bun, npm, pnpm, or yarn, then run `<pm> install` in the new project.",
+            "No package manager found on PATH. Install bun, npm, pnpm, or yarn, then install dependencies in the new project.",
           );
         } else {
           const lockfilePm = detectFromLockfile(dirPath);
@@ -342,7 +355,9 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
     if (args[ARG_SKIP_GIT] !== true) {
       const shouldGit =
         enableGithubActions ||
-        (interactive ? await confirm("Initialize git repository?") : true);
+        (interactive
+          ? await confirm("Initialize git repository?", { optional: true })
+          : true);
       if (shouldGit) {
         const gitInit = Bun.spawn(["git", "init"], {
           cwd: dirPath,
@@ -378,7 +393,7 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
       args[ARG_DEPLOY] !== undefined
         ? args[ARG_DEPLOY]
         : interactive
-          ? await confirm("Create script on bunny.net?")
+          ? await confirm("Create script on bunny.net?", { optional: true })
           : false;
 
     if (shouldDeploy) {
@@ -407,23 +422,49 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
           hostname: created.hostname,
         };
 
-        if (
-          deployResult.hostname &&
-          output !== "json" &&
-          process.stdout.isTTY
-        ) {
-          const shouldOpen = await confirm("Open script in browser?");
-          if (shouldOpen) {
-            const url = deployResult.hostname.startsWith("http")
-              ? deployResult.hostname
-              : `https://${deployResult.hostname}`;
-            logger.dim(`  Opening ${url}`);
-            openBrowser(url);
-          } else {
-            logger.dim(
-              "  Make changes locally, then run `bunny scripts deploy <file>` to publish.",
-            );
+        const isInteractive = output !== "json" && process.stdout.isTTY;
+
+        // Offer a custom domain; on SSL success the browser prompt opens it instead.
+        let openTarget = deployResult.hostname;
+        if (created.pullZoneId != null && isInteractive) {
+          const { value } = await prompts({
+            type: "text",
+            name: "value",
+            message: "Custom domain (leave blank to skip):",
+          });
+          const domain = normalizeHostname(value ?? "");
+          if (domain) {
+            // A domain failure mustn't trip the script-creation catch — the script already exists.
+            try {
+              // The user is still outside the project directory, so hints must carry --id.
+              const sslIssued = await setupCustomDomain({
+                profile,
+                apiKey,
+                verbose,
+                pullZoneId: created.pullZoneId,
+                domain,
+                scriptId: created.id,
+                linked: false,
+                interactive: true,
+              });
+              if (sslIssued) openTarget = domain;
+            } catch (err: unknown) {
+              const message = err instanceof Error ? err.message : "";
+              logger.warn(
+                message
+                  ? `Couldn't finish setting up ${domain}: ${message}`
+                  : `Couldn't finish setting up ${domain}.`,
+              );
+              logger.dim(
+                `  Retry later: bunny scripts domains add ${domain} --id ${created.id} --wait`,
+              );
+            }
+            logger.log();
           }
+        }
+
+        if (openTarget && isInteractive) {
+          await promptOpenInBrowser(openTarget);
         } else if (deployResult.hostname) {
           logger.dim(`  URL: ${deployResult.hostname}`);
         }
@@ -435,10 +476,11 @@ export const scriptsInitCommand = defineCommand<InitArgs>({
           );
           logger.dim(`  SCRIPT_ID = ${created.id}`);
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "";
         logger.warn(
-          err?.message
-            ? `Could not create script on bunny.net: ${err.message}`
+          message
+            ? `Could not create script on bunny.net: ${message}`
             : "Could not create script on bunny.net.",
         );
         logger.dim(

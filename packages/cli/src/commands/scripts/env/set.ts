@@ -1,17 +1,22 @@
 import { createComputeClient } from "@bunny.net/openapi-client";
-import type { components } from "@bunny.net/openapi-client/generated/compute.d.ts";
-import prompts from "prompts";
-import { resolveConfig } from "../../../config/index.ts";
-import { clientOptions } from "../../../core/client-options.ts";
-import { defineCommand } from "../../../core/define-command.ts";
-import { UserError } from "../../../core/errors.ts";
-import { logger } from "../../../core/logger.ts";
-import { resolveManifestId } from "../../../core/manifest.ts";
-import { spinner } from "../../../core/ui.ts";
-import { SCRIPT_MANIFEST } from "../constants.ts";
-
-type EdgeScriptVariable = components["schemas"]["EdgeScriptVariableModel"];
-type EdgeScriptSecret = components["schemas"]["EdgeScriptSecretModel"];
+import { fetchEnvEntries } from "@/commands/scripts/api.ts";
+import {
+  type ScriptSelectorArgs,
+  scriptIdOptionBuilder,
+  selectScript,
+} from "@/commands/scripts/interactive.ts";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { UserError } from "@/core/errors.ts";
+import { logger } from "@/core/logger.ts";
+import { prompts, withSpinner } from "@/core/ui.ts";
+import {
+  failPushIfIncomplete,
+  looksSecret,
+  pushEnvFile,
+  reportPush,
+} from "./env-push.ts";
 
 const COMMAND = "set [name] [value]";
 const DESCRIPTION = "Set an environment variable or secret for an Edge Script.";
@@ -20,16 +25,17 @@ const ARG_NAME = "name";
 const ARG_NAME_DESCRIPTION = "Variable name (will be uppercased)";
 const ARG_VALUE = "value";
 const ARG_VALUE_DESCRIPTION = "Variable value";
-const ARG_ID = "id";
-const ARG_ID_DESCRIPTION = "Edge Script ID (uses linked script if omitted)";
 const ARG_SECRET = "secret";
 const ARG_SECRET_DESCRIPTION = "Store as an encrypted secret";
+const ARG_FROM_FILE = "from-file";
+const ARG_FROM_FILE_DESCRIPTION =
+  "Push a .env file to the script, as `scripts env push` does";
 
-interface SetArgs {
+interface SetArgs extends ScriptSelectorArgs {
   [ARG_NAME]?: string;
   [ARG_VALUE]?: string;
-  [ARG_ID]?: number;
   [ARG_SECRET]?: boolean;
+  [ARG_FROM_FILE]?: string;
 }
 
 /**
@@ -61,41 +67,83 @@ export const scriptsEnvSetCommand = defineCommand<SetArgs>({
   examples: [
     ['$0 scripts env set MY_VAR "hello"', "Set a plain variable"],
     ['$0 scripts env set API_KEY "sk-…" --secret', "Set a secret"],
+    [
+      "$0 scripts env set --from-file .env",
+      "Push a .env file, as `scripts env push` does",
+    ],
     ["$0 scripts env set", "Interactive mode"],
   ],
 
   builder: (yargs) =>
-    yargs
-      .positional(ARG_NAME, {
-        type: "string",
-        describe: ARG_NAME_DESCRIPTION,
-      })
-      .positional(ARG_VALUE, {
-        type: "string",
-        describe: ARG_VALUE_DESCRIPTION,
-      })
-      .option(ARG_ID, {
-        type: "number",
-        describe: ARG_ID_DESCRIPTION,
-      })
+    scriptIdOptionBuilder(
+      yargs
+        .positional(ARG_NAME, {
+          type: "string",
+          describe: ARG_NAME_DESCRIPTION,
+        })
+        .positional(ARG_VALUE, {
+          type: "string",
+          describe: ARG_VALUE_DESCRIPTION,
+        }),
+    )
       .option(ARG_SECRET, {
         type: "boolean",
         describe: ARG_SECRET_DESCRIPTION,
+      })
+      .option(ARG_FROM_FILE, {
+        type: "string",
+        describe: ARG_FROM_FILE_DESCRIPTION,
       }),
 
   handler: async ({
     [ARG_NAME]: rawName,
     [ARG_VALUE]: rawValue,
-    [ARG_ID]: rawId,
+    id: rawId,
     [ARG_SECRET]: secret,
+    [ARG_FROM_FILE]: fromFile,
+    link,
     profile,
     output,
     verbose,
     apiKey,
   }) => {
-    const id = resolveManifestId(SCRIPT_MANIFEST, rawId, "script");
+    const config = resolveConfig(profile, apiKey, verbose);
+    const client = createComputeClient(clientOptions(config, verbose));
 
-    const interactive = !rawName;
+    const { id, offerLink } = await selectScript(client, {
+      id: rawId,
+      link,
+      output,
+    });
+
+    if (fromFile !== undefined) {
+      if (rawName) {
+        throw new UserError(
+          "--from-file sets every variable in the file, so it takes no name.",
+          `Drop the name, or run \`bunny scripts env push ${fromFile}\`.`,
+        );
+      }
+      if (secret !== undefined) {
+        throw new UserError(
+          "--secret applies to one variable, not a whole file.",
+          `Name the encrypted ones with \`bunny scripts env push ${fromFile || ".env"} --secrets DB_TOKEN,API_KEY\`.`,
+        );
+      }
+      const results = await pushEnvFile(client, id, {
+        file: fromFile || undefined,
+        output,
+      });
+      if (output === "json") {
+        logger.log(JSON.stringify(results, null, 2));
+        failPushIfIncomplete(results);
+        return;
+      }
+      reportPush(results);
+      failPushIfIncomplete(results);
+      await offerLink();
+      return;
+    }
+
     let name = rawName;
     if (!name) {
       const { value } = await prompts({
@@ -109,12 +157,12 @@ export const scriptsEnvSetCommand = defineCommand<SetArgs>({
 
     let isSecret = secret;
     if (isSecret === undefined) {
-      if (interactive) {
+      if (rawValue === undefined) {
         const { confirmed } = await prompts({
           type: "confirm",
           name: "confirmed",
           message: "Is this a secret?",
-          initial: false,
+          initial: looksSecret(name),
         });
         isSecret = confirmed ?? false;
       } else {
@@ -133,73 +181,46 @@ export const scriptsEnvSetCommand = defineCommand<SetArgs>({
     }
     if (value === undefined) throw new UserError("Variable value is required.");
 
-    name = name.toUpperCase();
-
-    const config = resolveConfig(profile, apiKey, verbose);
-    const client = createComputeClient(clientOptions(config, verbose));
-
-    const spin = spinner("Checking for conflicts...");
-    spin.start();
-
-    const [scriptResult, secretsResult] = await Promise.all([
-      client.GET("/compute/script/{id}", {
-        params: { path: { id } },
-      }),
-      client.GET("/compute/script/{id}/secrets", {
-        params: { path: { id } },
-      }),
-    ]);
-
-    const existingVars = scriptResult.data?.EdgeScriptVariables ?? [];
-    const existingSecrets = secretsResult.data?.Secrets ?? [];
-
-    if (isSecret) {
-      const conflict = existingVars.find(
-        (v: EdgeScriptVariable) => v.Name?.toUpperCase() === name,
+    const varName = name.toUpperCase();
+    await withSpinner("Checking for conflicts...", async (spin) => {
+      // A name conflict is one held by the opposite type (variable vs secret).
+      const conflict = (await fetchEnvEntries(client, id)).find(
+        (e) => e.name.toUpperCase() === varName && e.secret !== isSecret,
       );
       if (conflict) {
-        spin.stop();
         throw new UserError(
-          `A variable named "${name}" already exists. Remove it first to set it as a secret.`,
+          isSecret
+            ? `A variable named "${varName}" already exists. Remove it first to set it as a secret.`
+            : `A secret named "${varName}" already exists. Remove it first to set it as a variable.`,
         );
       }
-    } else {
-      const conflict = existingSecrets.find(
-        (s: EdgeScriptSecret) => s.Name?.toUpperCase() === name,
-      );
-      if (conflict) {
-        spin.stop();
-        throw new UserError(
-          `A secret named "${name}" already exists. Remove it first to set it as a variable.`,
-        );
+
+      spin.text = isSecret ? "Setting secret..." : "Setting variable...";
+
+      if (isSecret) {
+        await client.PUT("/compute/script/{id}/secrets", {
+          params: { path: { id } },
+          body: { Name: varName, Secret: value },
+        });
+      } else {
+        await client.PUT("/compute/script/{id}/variables", {
+          params: { path: { id } },
+          body: { Name: varName, DefaultValue: value },
+        });
       }
-    }
-
-    spin.text = isSecret ? "Setting secret..." : "Setting variable...";
-
-    if (isSecret) {
-      await client.PUT("/compute/script/{id}/secrets", {
-        params: { path: { id } },
-        body: { Name: name, Secret: value },
-      });
-    } else {
-      await client.PUT("/compute/script/{id}/variables", {
-        params: { path: { id } },
-        body: { Name: name, DefaultValue: value },
-      });
-    }
-
-    spin.stop();
+    });
 
     if (output === "json") {
-      logger.log(JSON.stringify({ name, secret: isSecret }, null, 2));
+      logger.log(JSON.stringify({ name: varName, secret: isSecret }, null, 2));
       return;
     }
 
     logger.success(
       isSecret
-        ? `Secret "${name}" set successfully.`
-        : `Variable "${name}" set to "${value}".`,
+        ? `Secret "${varName}" set successfully.`
+        : `Variable "${varName}" set to "${value}".`,
     );
+
+    await offerLink();
   },
 });

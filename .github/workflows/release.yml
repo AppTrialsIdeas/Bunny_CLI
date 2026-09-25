@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .tool-versions
       - run: bun install
       - name: Create Release Pull Request
         id: changesets-action
@@ -37,14 +39,62 @@ jobs:
     if: needs.changesets.outputs.hasChangesets == 'false'
     outputs:
       cli-version: ${{ steps.check-cli.outputs.version }}
+      database-client-version: ${{ steps.check-database-client.outputs.version }}
       database-shell-version: ${{ steps.check-database-shell.outputs.version }}
+      openapi-client-version: ${{ steps.check-openapi-client.outputs.version }}
+      sandbox-version: ${{ steps.check-sandbox.outputs.version }}
+      scriptable-dns-types-version: ${{ steps.check-scriptable-dns-types.outputs.version }}
     steps:
       - uses: actions/checkout@v5
+      - name: Check openapi-client version
+        id: check-openapi-client
+        run: |
+          VERSION=$(node -p "require('./packages/openapi-client/package.json').version")
+          PUBLISHED=$(npm view @bunny.net/openapi-client version 2>/dev/null || echo "0.0.0")
+          if [ "$VERSION" != "$PUBLISHED" ]; then
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "New version detected: $VERSION (published: $PUBLISHED)"
+          else
+            echo "No version change: $VERSION"
+          fi
+      - name: Check sandbox version
+        id: check-sandbox
+        run: |
+          VERSION=$(node -p "require('./packages/sandbox/package.json').version")
+          PUBLISHED=$(npm view @bunny.net/sandbox version 2>/dev/null || echo "0.0.0")
+          if [ "$VERSION" != "$PUBLISHED" ]; then
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "New version detected: $VERSION (published: $PUBLISHED)"
+          else
+            echo "No version change: $VERSION"
+          fi
+      - name: Check scriptable-dns-types version
+        id: check-scriptable-dns-types
+        run: |
+          VERSION=$(node -p "require('./packages/scriptable-dns-types/package.json').version")
+          PUBLISHED=$(npm view @bunny.net/scriptable-dns-types version 2>/dev/null || echo "0.0.0")
+          if [ "$VERSION" != "$PUBLISHED" ]; then
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "New version detected: $VERSION (published: $PUBLISHED)"
+          else
+            echo "No version change: $VERSION"
+          fi
       - name: Check CLI version
         id: check-cli
         run: |
           VERSION=$(node -p "require('./packages/cli/package.json').version")
           PUBLISHED=$(npm view @bunny.net/cli version 2>/dev/null || echo "0.0.0")
+          if [ "$VERSION" != "$PUBLISHED" ]; then
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "New version detected: $VERSION (published: $PUBLISHED)"
+          else
+            echo "No version change: $VERSION"
+          fi
+      - name: Check database-client version
+        id: check-database-client
+        run: |
+          VERSION=$(node -p "require('./packages/database-client/package.json').version")
+          PUBLISHED=$(npm view @bunny.net/database-client version 2>/dev/null || echo "0.0.0")
           if [ "$VERSION" != "$PUBLISHED" ]; then
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "New version detected: $VERSION (published: $PUBLISHED)"
@@ -97,7 +147,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.11"
+          bun-version-file: .tool-versions
       - run: bun install
 
       - name: Build database studio
@@ -105,6 +155,13 @@ jobs:
 
       - name: Build binary
         run: bun build packages/cli/src/index.ts --compile --minify --sourcemap --target=${{ matrix.target }} --outfile ${{ matrix.binary }}
+
+      # bun --compile leaves an invalid signature (ad-hoc on arm64, Bun's own Developer ID on x64), so replace it with a valid ad-hoc one.
+      - name: Re-sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --force --identifier net.bunny.cli ${{ matrix.binary }}
+          codesign --verify --strict --verbose=2 ${{ matrix.binary }}
 
       - name: Prepare npm package
         run: cp ${{ matrix.binary }} packages/${{ matrix.npm-pkg }}/
@@ -114,6 +171,50 @@ jobs:
         with:
           name: ${{ matrix.npm-pkg }}
           path: packages/${{ matrix.npm-pkg }}/
+          if-no-files-found: error
+
+  build-cli-baseline:
+    name: Build ${{ matrix.binary }}
+    needs: version
+    if: needs.version.outputs.cli-version
+    strategy:
+      matrix:
+        include:
+          - target: bun-linux-x64-baseline
+            os: ubuntu-latest
+            binary: bunny-linux-x64-baseline
+          - target: bun-darwin-x64-baseline
+            os: macos-latest
+            binary: bunny-darwin-x64-baseline
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .tool-versions
+      - run: bun install
+
+      - name: Build database studio
+        run: bun run --filter @bunny.net/database-studio build:client
+
+      # Baseline targets avoid AVX2, so the binary runs on pre-Haswell x64 CPUs that crash the default build with SIGILL.
+      - name: Build binary
+        run: bun build packages/cli/src/index.ts --compile --minify --sourcemap --target=${{ matrix.target }} --outfile ${{ matrix.binary }}
+
+      # bun --compile leaves an invalid signature (ad-hoc on arm64, Bun's own Developer ID on x64), so replace it with a valid ad-hoc one.
+      - name: Re-sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --force --identifier net.bunny.cli ${{ matrix.binary }}
+          codesign --verify --strict --verbose=2 ${{ matrix.binary }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
           if-no-files-found: error
 
   build-database-shell-binaries:
@@ -150,11 +251,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.11"
+          bun-version-file: .tool-versions
       - run: bun install
 
       - name: Build binary
         run: bun build packages/database-shell/src/cli.ts --compile --minify --sourcemap --target=${{ matrix.target }} --outfile ${{ matrix.binary }}
+
+      # bun --compile leaves an invalid signature (ad-hoc on arm64, Bun's own Developer ID on x64), so replace it with a valid ad-hoc one.
+      - name: Re-sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --force --identifier net.bunny.database-shell ${{ matrix.binary }}
+          codesign --verify --strict --verbose=2 ${{ matrix.binary }}
 
       - name: Prepare npm package
         run: cp ${{ matrix.binary }} packages/${{ matrix.npm-pkg }}/
@@ -166,18 +274,64 @@ jobs:
           path: packages/${{ matrix.npm-pkg }}/
           if-no-files-found: error
 
+  build-database-shell-baseline:
+    name: Build ${{ matrix.binary }}
+    needs: version
+    if: needs.version.outputs.database-shell-version
+    strategy:
+      matrix:
+        include:
+          - target: bun-linux-x64-baseline
+            os: ubuntu-latest
+            binary: bsql-linux-x64-baseline
+          - target: bun-darwin-x64-baseline
+            os: macos-latest
+            binary: bsql-darwin-x64-baseline
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .tool-versions
+      - run: bun install
+
+      # Baseline targets avoid AVX2, so the binary runs on pre-Haswell x64 CPUs that crash the default build with SIGILL.
+      - name: Build binary
+        run: bun build packages/database-shell/src/cli.ts --compile --minify --sourcemap --target=${{ matrix.target }} --outfile ${{ matrix.binary }}
+
+      # bun --compile leaves an invalid signature (ad-hoc on arm64, Bun's own Developer ID on x64), so replace it with a valid ad-hoc one.
+      - name: Re-sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --force --identifier net.bunny.database-shell ${{ matrix.binary }}
+          codesign --verify --strict --verbose=2 ${{ matrix.binary }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+
   publish-cli:
     name: Publish CLI
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     needs:
       - version
       - build-cli-binaries
+      - build-cli-baseline
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Download all platform artifacts
@@ -191,18 +345,52 @@ jobs:
             cp -r npm-artifacts/$pkg/* packages/$pkg/
           done
 
+      # x64 packages also ship a baseline binary the wrapper falls back to on AVX2-less CPUs.
+      - name: Copy baseline binaries into x64 npm packages
+        run: |
+          cp npm-artifacts/bunny-linux-x64-baseline/bunny-linux-x64-baseline packages/cli-linux-x64/bunny-baseline
+          cp npm-artifacts/bunny-darwin-x64-baseline/bunny-darwin-x64-baseline packages/cli-darwin-x64/bunny-baseline
+
       - name: Set execute permissions
         run: |
           chmod +x packages/cli-linux-x64/bunny
           chmod +x packages/cli-linux-arm64/bunny
           chmod +x packages/cli-darwin-x64/bunny
           chmod +x packages/cli-darwin-arm64/bunny
+          chmod +x packages/cli-linux-x64/bunny-baseline
+          chmod +x packages/cli-darwin-x64/bunny-baseline
+
+      # Everything that can fail runs before the npm publish, which cannot be undone.
+      - name: Collect release binaries
+        run: |
+          mkdir release
+          mv npm-artifacts/cli-linux-x64/bunny release/bunny-linux-x64
+          mv npm-artifacts/cli-linux-arm64/bunny release/bunny-linux-arm64
+          mv npm-artifacts/cli-darwin-x64/bunny release/bunny-darwin-x64
+          mv npm-artifacts/cli-darwin-arm64/bunny release/bunny-darwin-arm64
+          mv npm-artifacts/cli-windows-x64/bunny.exe release/bunny-windows-x64.exe
+          mv npm-artifacts/bunny-linux-x64-baseline/bunny-linux-x64-baseline release/
+          mv npm-artifacts/bunny-darwin-x64-baseline/bunny-darwin-x64-baseline release/
+
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum bunny-* > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: release/SHA256SUMS
 
       - name: Publish platform packages
         run: |
           for pkg in cli-linux-x64 cli-linux-arm64 cli-darwin-x64 cli-darwin-arm64 cli-windows-x64; do
             cd packages/$pkg
-            npm publish --access public
+            VERSION=$(node -p "require('./package.json').version")
+            if [ -n "$(npm view "@bunny.net/$pkg@$VERSION" version 2>/dev/null)" ]; then
+              echo "Skipping @bunny.net/$pkg@$VERSION (already published)"
+            else
+              npm publish --access public
+            fi
             cd ../..
           done
         env:
@@ -211,17 +399,14 @@ jobs:
       - name: Publish @bunny.net/cli
         run: |
           cd packages/cli
-          npm publish --access public
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@bunny.net/cli@$VERSION" version 2>/dev/null)" ]; then
+            echo "Skipping @bunny.net/cli@$VERSION (already published)"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Rename binaries for release
-        run: |
-          mv npm-artifacts/cli-linux-x64/bunny npm-artifacts/cli-linux-x64/bunny-linux-x64
-          mv npm-artifacts/cli-linux-arm64/bunny npm-artifacts/cli-linux-arm64/bunny-linux-arm64
-          mv npm-artifacts/cli-darwin-x64/bunny npm-artifacts/cli-darwin-x64/bunny-darwin-x64
-          mv npm-artifacts/cli-darwin-arm64/bunny npm-artifacts/cli-darwin-arm64/bunny-darwin-arm64
-          mv npm-artifacts/cli-windows-x64/bunny.exe npm-artifacts/cli-windows-x64/bunny-windows-x64.exe
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -230,12 +415,42 @@ jobs:
           name: v${{ needs.version.outputs.cli-version }}
           generate_release_notes: true
           files: |
-            npm-artifacts/cli-linux-x64/bunny-linux-x64
-            npm-artifacts/cli-linux-arm64/bunny-linux-arm64
-            npm-artifacts/cli-darwin-x64/bunny-darwin-x64
-            npm-artifacts/cli-darwin-arm64/bunny-darwin-arm64
-            npm-artifacts/cli-windows-x64/bunny-windows-x64.exe
+            release/bunny-linux-x64
+            release/bunny-linux-arm64
+            release/bunny-darwin-x64
+            release/bunny-darwin-arm64
+            release/bunny-windows-x64.exe
+            release/bunny-linux-x64-baseline
+            release/bunny-darwin-x64-baseline
+            release/SHA256SUMS
           fail_on_unmatched_files: true
+
+  publish-database-client:
+    name: Publish database-client
+    runs-on: ubuntu-latest
+    needs: version
+    if: needs.version.outputs.database-client-version
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .tool-versions
+      - run: bun install
+
+      - name: Build package
+        run: bun run --filter @bunny.net/database-client build
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish @bunny.net/database-client
+        run: |
+          cd packages/database-client
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-database-shell:
     name: Publish database-shell
@@ -243,12 +458,13 @@ jobs:
     needs:
       - version
       - build-database-shell-binaries
+      - build-database-shell-baseline
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Download all platform artifacts
@@ -262,18 +478,32 @@ jobs:
             cp -r npm-artifacts/$pkg/* packages/$pkg/
           done
 
+      # x64 packages also ship a baseline binary the wrapper falls back to on AVX2-less CPUs.
+      - name: Copy baseline binaries into x64 npm packages
+        run: |
+          cp npm-artifacts/bsql-linux-x64-baseline/bsql-linux-x64-baseline packages/database-shell-linux-x64/bsql-baseline
+          cp npm-artifacts/bsql-darwin-x64-baseline/bsql-darwin-x64-baseline packages/database-shell-darwin-x64/bsql-baseline
+
       - name: Set execute permissions
         run: |
           chmod +x packages/database-shell-linux-x64/bsql
           chmod +x packages/database-shell-linux-arm64/bsql
           chmod +x packages/database-shell-darwin-x64/bsql
           chmod +x packages/database-shell-darwin-arm64/bsql
+          chmod +x packages/database-shell-linux-x64/bsql-baseline
+          chmod +x packages/database-shell-darwin-x64/bsql-baseline
 
       - name: Publish platform packages
         run: |
+          # Re-runs after a partial release must not die on packages that already went up.
           for pkg in database-shell-linux-x64 database-shell-linux-arm64 database-shell-darwin-x64 database-shell-darwin-arm64 database-shell-windows-x64; do
             cd packages/$pkg
-            npm publish --access public
+            VERSION=$(node -p "require('./package.json').version")
+            if [ -n "$(npm view "@bunny.net/$pkg@$VERSION" version 2>/dev/null)" ]; then
+              echo "Skipping @bunny.net/$pkg@$VERSION (already published)"
+            else
+              npm publish --access public
+            fi
             cd ../..
           done
         env:
@@ -282,6 +512,100 @@ jobs:
       - name: Publish @bunny.net/database-shell
         run: |
           cd packages/database-shell
-          npm publish --access public
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@bunny.net/database-shell@$VERSION" version 2>/dev/null)" ]; then
+            echo "Skipping @bunny.net/database-shell@$VERSION (already published)"
+          else
+            npm publish --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-openapi-client:
+    name: Publish openapi-client
+    runs-on: ubuntu-latest
+    needs: version
+    if: needs.version.outputs.openapi-client-version
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .tool-versions
+      - run: bun install
+
+      - name: Build package
+        run: bun run --filter @bunny.net/openapi-client build
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish @bunny.net/openapi-client
+        run: |
+          cd packages/openapi-client
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@bunny.net/openapi-client@$VERSION" version 2>/dev/null)" ]; then
+            echo "Skipping @bunny.net/openapi-client@$VERSION (already published)"
+          else
+            npm publish --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-sandbox:
+    name: Publish sandbox
+    runs-on: ubuntu-latest
+    needs: version
+    if: needs.version.outputs.sandbox-version
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .tool-versions
+      - run: bun install
+
+      # Sandbox's build type-checks against openapi-client's package exports (dist/), so build it first.
+      - name: Build openapi-client
+        run: bun run --filter @bunny.net/openapi-client build
+
+      - name: Build package
+        run: bun run --filter @bunny.net/sandbox build
+
+      # bun publish (not npm) rewrites the workspace:* dependency on @bunny.net/openapi-client to a real version.
+      - name: Publish @bunny.net/sandbox
+        run: |
+          cd packages/sandbox
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@bunny.net/sandbox@$VERSION" version 2>/dev/null)" ]; then
+            echo "Skipping @bunny.net/sandbox@$VERSION (already published)"
+          else
+            bun publish --access public
+          fi
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-scriptable-dns-types:
+    name: Publish scriptable-dns-types
+    runs-on: ubuntu-latest
+    needs: version
+    if: needs.version.outputs.scriptable-dns-types-version
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish @bunny.net/scriptable-dns-types
+        run: |
+          cd packages/scriptable-dns-types
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@bunny.net/scriptable-dns-types@$VERSION" version 2>/dev/null)" ]; then
+            echo "Skipping @bunny.net/scriptable-dns-types@$VERSION (already published)"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

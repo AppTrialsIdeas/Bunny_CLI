@@ -1,21 +1,22 @@
 import { createDbClient } from "@bunny.net/openapi-client";
-import { resolveConfig } from "../../../config/index.ts";
-import { clientOptions } from "../../../core/client-options.ts";
-import { defineCommand } from "../../../core/define-command.ts";
-import { formatKeyValue } from "../../../core/format.ts";
-import { logger } from "../../../core/logger.ts";
-import { confirm, spinner } from "../../../core/ui.ts";
-import {
-  readEnvValue,
-  removeEnvValue,
-  writeEnvValue,
-} from "../../../utils/env-file.ts";
+import { generateToken } from "@/commands/db/api.ts";
 import {
   ARG_DATABASE_ID,
   ENV_DATABASE_AUTH_TOKEN,
   ENV_DATABASE_URL,
-} from "../constants.ts";
-import { resolveDbId } from "../resolve-db.ts";
+} from "@/commands/db/constants.ts";
+import { resolveDbId } from "@/commands/db/resolve-db.ts";
+import { resolveConfig } from "@/config/index.ts";
+import { clientOptions } from "@/core/client-options.ts";
+import { defineCommand } from "@/core/define-command.ts";
+import { formatKeyValue } from "@/core/format.ts";
+import { logger } from "@/core/logger.ts";
+import { confirm, spinner } from "@/core/ui.ts";
+import {
+  readEnvValue,
+  removeEnvValue,
+  writeEnvValue,
+} from "@/utils/env-file.ts";
 
 const COMMAND = `invalidate [${ARG_DATABASE_ID}]`;
 const DESCRIPTION = "Invalidate all auth tokens for a database.";
@@ -161,7 +162,7 @@ export const dbTokensInvalidateCommand = defineCommand<{
     if (existingToken) {
       const shouldRemove = await confirm(
         `Remove ${ENV_DATABASE_AUTH_TOKEN} from ${existingToken.envPath}?`,
-        { force },
+        { force, optional: true },
       );
       if (shouldRemove) {
         removeEnvValue(ENV_DATABASE_AUTH_TOKEN, existingToken.envPath);
@@ -174,7 +175,7 @@ export const dbTokensInvalidateCommand = defineCommand<{
     // Without --force: prompt the user
     const shouldCreate = force
       ? !!regenerate
-      : await confirm("Generate a new token?");
+      : await confirm("Generate a new token?", { optional: true });
     if (!shouldCreate) {
       logger.warn("All tokens have been invalidated. No valid tokens remain.");
       logger.dim(
@@ -187,9 +188,9 @@ export const dbTokensInvalidateCommand = defineCommand<{
     spin3.start();
 
     const [tokenResult, dbResult] = await Promise.all([
-      client.PUT("/v2/databases/{db_id}/auth/generate", {
-        params: { path: { db_id: databaseId } },
-        body: { authorization: "full-access", expires_at: null },
+      generateToken(client, databaseId, {
+        authorization: "full-access",
+        expiresAt: null,
       }),
       client.GET("/v2/databases/{db_id}", {
         params: { path: { db_id: databaseId } },
@@ -198,7 +199,7 @@ export const dbTokensInvalidateCommand = defineCommand<{
 
     spin3.stop();
 
-    const newToken = tokenResult.data?.token;
+    const newToken = tokenResult?.token;
     const dbUrl = dbResult.data?.db?.url;
 
     if (!newToken) {
@@ -225,7 +226,9 @@ export const dbTokensInvalidateCommand = defineCommand<{
     const shouldSave =
       saveEnv !== undefined
         ? saveEnv
-        : await confirm(`Save ${ENV_DATABASE_AUTH_TOKEN} to .env?`);
+        : await confirm(`Save ${ENV_DATABASE_AUTH_TOKEN} to .env?`, {
+            optional: true,
+          });
     if (shouldSave) {
       const envPath = existingToken?.envPath;
       writeEnvValue(ENV_DATABASE_AUTH_TOKEN, newToken, envPath);
